@@ -1,0 +1,742 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+BB_API_BASE="https://api.bitbucket.org/2.0"
+BB_CONFIG_FILE="$HOME/.config/bb/config"
+
+# ---------------------------------------------------------------------------
+# Tiny helpers — consistent error/warning prefixes; portable URL opener
+# ---------------------------------------------------------------------------
+_die()  { echo "error: $*" >&2; exit 1; }
+_warn() { echo "warning: $*" >&2; }
+
+_open_url() {
+  if command -v open &>/dev/null; then
+    open "$1"
+  elif command -v xdg-open &>/dev/null; then
+    xdg-open "$1"
+  else
+    echo "Visit: $1"
+  fi
+}
+
+# Extract a human-readable error message from a Bitbucket API JSON body
+_api_error_msg() {
+  local body="$1" status="$2"
+  printf '%s' "$body" | jq -r --arg s "$status" '.error.message // .error // "HTTP \($s)"' 2>/dev/null || printf 'HTTP %s' "$status"
+}
+
+# ---------------------------------------------------------------------------
+# Color support — suppressed when NO_COLOR is set or stdout is not a tty
+# ---------------------------------------------------------------------------
+if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then
+  C_RESET='\033[0m'
+  C_YELLOW='\033[0;33m'
+  C_GREEN='\033[0;32m'
+  C_RED='\033[0;31m'
+  C_GRAY='\033[0;90m'
+  C_BOLD='\033[1m'
+else
+  C_RESET='' C_YELLOW='' C_GREEN='' C_RED='' C_GRAY='' C_BOLD=''
+fi
+
+# ---------------------------------------------------------------------------
+# Startup: check required tools
+# ---------------------------------------------------------------------------
+check_deps() {
+  local missing=0 dep
+  for dep in curl jq git; do
+    if ! command -v "$dep" &>/dev/null; then
+      echo "error: '$dep' is required but not installed." >&2
+      echo "  Install: brew install $dep" >&2
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ] || exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Auth: load creds from env (wins) or ~/.config/bb/config (fallback)
+# Sets BB_CREDS_SOURCE=env|config so callers can report where creds came from.
+# Call lazily — only before API commands. auth login/logout/help/version skip this.
+# ---------------------------------------------------------------------------
+BB_CREDS_SOURCE=""
+
+load_creds() {
+  if [[ -n "${BB_EMAIL:-}" && -n "${BB_TOKEN:-}" ]]; then
+    BB_CREDS_SOURCE="env"
+  elif [[ -f "$BB_CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1091
+    source "$BB_CONFIG_FILE"
+    BB_CREDS_SOURCE="config"
+  fi
+  [[ -n "${BB_EMAIL:-}" && -n "${BB_TOKEN:-}" ]] || _die "Not logged in. Run: bb auth login"
+}
+
+# ---------------------------------------------------------------------------
+# Auth subcommands: login, status, logout
+# ---------------------------------------------------------------------------
+auth_login() {
+  echo "Opening Atlassian token page in your browser..."
+  _open_url "https://id.atlassian.com/manage-profile/security/api-tokens"
+
+  echo ""
+  echo "Create a token with the following scopes:"
+  echo "  - read:repository:bitbucket"
+  echo "  - read:pullrequest:bitbucket"
+  echo "  - write:pullrequest:bitbucket"
+  echo ""
+
+  local email token
+  printf 'Atlassian email: '
+  read -r email
+  [[ -n "$email" && "$email" == *@* ]] || _die "invalid email address"
+
+  printf 'API token (hidden): '
+  read -rs token
+  printf '\n'
+  [ -n "$token" ] || _die "token cannot be empty"
+
+  if try_detect_workspace_slug; then
+    local slug="$DETECTED_WORKSPACE"
+    verify_workspace_creds "$email" "$token" "$slug"
+    if [ "$VERIFY_STATUS" -ge 200 ] && [ "$VERIFY_STATUS" -lt 300 ]; then
+      local repo_count
+      repo_count=$(printf '%s' "$VERIFY_BODY" | jq -r '.size // 0' 2>/dev/null || echo "0")
+      printf 'Verified against workspace: %s. Repository access confirmed (%s repos visible).\n' "$slug" "$repo_count"
+    elif [ "$VERIFY_STATUS" -eq 401 ] || [ "$VERIFY_STATUS" -eq 403 ]; then
+      _die "$(_api_error_msg "$VERIFY_BODY" "$VERIFY_STATUS")"
+    elif [ "$VERIFY_STATUS" -eq 404 ]; then
+      printf "Workspace '%s' not found or no access. Saving creds anyway — run a 'bb pr ...' command from a workspace you have access to, to confirm.\n" "$slug"
+    else
+      _die "authentication failed — $(_api_error_msg "$VERIFY_BODY" "$VERIFY_STATUS")"
+    fi
+  else
+    printf 'No Bitbucket workspace detected in current directory.\n'
+    printf "Skipping verification — credentials will be tested by your first 'bb pr ...' command.\n"
+  fi
+
+  mkdir -p "$(dirname "$BB_CONFIG_FILE")"
+  ( umask 077 && printf 'BB_EMAIL=%s\nBB_TOKEN=%s\n' "$email" "$token" > "$BB_CONFIG_FILE" )
+  chmod 600 "$BB_CONFIG_FILE"
+
+  echo "Saved to ~/.config/bb/config."
+}
+
+auth_status() {
+  # Resolve creds without calling load_creds (which exits early with error)
+  local email="" token="" creds_via=""
+  if [[ -n "${BB_EMAIL:-}" && -n "${BB_TOKEN:-}" ]]; then
+    email="$BB_EMAIL"
+    token="$BB_TOKEN"
+    creds_via="env"
+  elif [[ -f "$BB_CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1091
+    source "$BB_CONFIG_FILE"
+    email="${BB_EMAIL:-}"
+    token="${BB_TOKEN:-}"
+    creds_via="config"
+  fi
+
+  if [[ -z "$email" || -z "$token" ]]; then
+    echo "Not logged in. Run \`bb auth login\`."
+    exit 1
+  fi
+
+  if try_detect_workspace_slug; then
+    local slug="$DETECTED_WORKSPACE"
+    verify_workspace_creds "$email" "$token" "$slug"
+    if [ "$VERIFY_STATUS" -ge 200 ] && [ "$VERIFY_STATUS" -lt 300 ]; then
+      local repo_count
+      repo_count=$(printf '%s' "$VERIFY_BODY" | jq -r '.size // 0' 2>/dev/null || echo "0")
+      printf 'Logged in via %s. Verified against workspace: %s (%s repos visible).\n' "$creds_via" "$slug" "$repo_count"
+    elif [ "$VERIFY_STATUS" -eq 401 ] || [ "$VERIFY_STATUS" -eq 403 ]; then
+      printf 'Logged in via %s, but credentials rejected: %s. Re-run `bb auth login`.\n' "$creds_via" "$(_api_error_msg "$VERIFY_BODY" "$VERIFY_STATUS")" >&2
+      exit 1
+    elif [ "$VERIFY_STATUS" -eq 404 ]; then
+      printf "Logged in via %s. Workspace '%s' not visible — verify your token has access.\n" "$creds_via" "$slug"
+    else
+      _die "authentication check failed — $(_api_error_msg "$VERIFY_BODY" "$VERIFY_STATUS")"
+    fi
+  else
+    printf 'Logged in via %s. (No workspace context for verification — run from a Bitbucket repo to verify.)\n' "$creds_via"
+  fi
+}
+
+auth_logout() {
+  if [[ -f "$BB_CONFIG_FILE" ]]; then
+    rm -f "$BB_CONFIG_FILE"
+    echo "Removed ~/.config/bb/config."
+  else
+    echo "No config file found at ~/.config/bb/config."
+  fi
+
+  if [[ -n "${BB_EMAIL:-}" || -n "${BB_TOKEN:-}" ]]; then
+    _warn "BB_EMAIL/BB_TOKEN still set in your shell environment — unset them manually if needed."
+  fi
+}
+
+auth_dispatch() {
+  local subcmd="${1:-}"
+  [ -n "$subcmd" ] || { usage_auth; exit 1; }
+  shift
+
+  case "$subcmd" in
+    login)   auth_login   "$@" ;;
+    status)  auth_status  "$@" ;;
+    logout)  auth_logout  "$@" ;;
+    *)
+      echo "error: unknown auth subcommand '$subcmd'" >&2
+      usage_auth
+      exit 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# API helpers.
+#   bb_api_raw  — generic curl+status-split; no Content-Type assumed.
+#                 Used for diff (text/plain) and other non-JSON endpoints.
+#   bb_api      — adds Content-Type: application/json; for normal API calls.
+# Both: returns body on stdout, exits 1 on non-2xx with the API error message.
+# ---------------------------------------------------------------------------
+bb_api_raw() {
+  local method="$1"; shift
+  local path="$1"; shift
+  local url
+
+  # Allow full URLs (for pagination .next links) or relative paths
+  if [[ "$path" == https://* ]]; then
+    url="$path"
+  else
+    url="${BB_API_BASE}${path}"
+  fi
+
+  local raw
+  # The trailing newline separator lets us split body from status robustly
+  raw=$(curl -sS -w $'\n%{http_code}' -X "$method" \
+    -u "${BB_EMAIL}:${BB_TOKEN}" \
+    "$@" "$url") || _die "curl failed (network error or bad TLS)"
+
+  local status="${raw##*$'\n'}"
+  local body="${raw%$'\n'*}"
+
+  if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+    _die "Bitbucket API returned $status — $(_api_error_msg "$body" "$status")"
+  fi
+
+  printf '%s' "$body"
+}
+
+bb_api() {
+  local method="$1"; shift
+  local path="$1"; shift
+  bb_api_raw "$method" "$path" -H "Content-Type: application/json" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Verify creds against a workspace using the repositories endpoint
+# (CHANGE-2770-safe: only needs read:repository:bitbucket scope).
+# Args: email token slug
+# Sets globals: VERIFY_STATUS, VERIFY_BODY
+# ---------------------------------------------------------------------------
+verify_workspace_creds() {
+  local raw
+  raw=$(curl -sS -w $'\n%{http_code}' \
+    -u "${1}:${2}" \
+    "${BB_API_BASE}/repositories/${3}?pagelen=1") || _die "curl failed (network error or bad TLS)"
+  VERIFY_STATUS="${raw##*$'\n'}"
+  VERIFY_BODY="${raw%$'\n'*}"
+}
+
+# ---------------------------------------------------------------------------
+# Try to detect workspace slug from the current directory's git remote.
+# Soft-fail: sets DETECTED_WORKSPACE and returns 0 on success, returns 1 if
+# not in a git repo or origin is not a Bitbucket URL. Does NOT exit.
+# ---------------------------------------------------------------------------
+DETECTED_WORKSPACE=""
+try_detect_workspace_slug() {
+  local remote_url
+  remote_url=$(git remote get-url origin 2>/dev/null) || return 1
+
+  if [[ "$remote_url" =~ bitbucket\.org[:/]([^/]+)/([^/]+)(\.git)?$ ]]; then
+    DETECTED_WORKSPACE="${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Parse git remote to extract workspace + repo slug
+# ---------------------------------------------------------------------------
+detect_repo() {
+  local remote_url
+  remote_url=$(git remote get-url origin 2>/dev/null) || {
+    echo "error: no git remote 'origin' found." >&2
+    exit 1
+  }
+
+  # ssh: git@bitbucket.org:WORKSPACE/REPO.git
+  # https: https://user@bitbucket.org/WORKSPACE/REPO.git
+  if [[ "$remote_url" =~ bitbucket\.org[:/]([^/]+)/([^/]+)(\.git)?$ ]]; then
+    BB_WORKSPACE="${BASH_REMATCH[1]}"
+    BB_REPO="${BASH_REMATCH[2]%.git}"
+  else
+    echo "error: origin is not a Bitbucket URL: $remote_url" >&2
+    echo "  Expected: git@bitbucket.org:WORKSPACE/REPO.git or https://...@bitbucket.org/WORKSPACE/REPO.git" >&2
+    exit 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Fetch the repo's mainbranch name from the API
+# ---------------------------------------------------------------------------
+get_default_branch() {
+  local info
+  info=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}")
+  printf '%s' "$info" | jq -r '.mainbranch.name'
+}
+
+# ---------------------------------------------------------------------------
+# Color-code a PR state string
+# ---------------------------------------------------------------------------
+colorize_state() {
+  local state="$1"
+  local upper
+  upper=$(printf '%s' "$state" | tr '[:lower:]' '[:upper:]')
+  case "$upper" in
+    OPEN)      printf '%b%s%b' "$C_YELLOW" "$state" "$C_RESET" ;;
+    MERGED)    printf '%b%s%b' "$C_GREEN"  "$state" "$C_RESET" ;;
+    DECLINED)  printf '%b%s%b' "$C_RED"    "$state" "$C_RESET" ;;
+    *)         printf '%b%s%b' "$C_GRAY"   "$state" "$C_RESET" ;; # SUPERSEDED, draft
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Resolve a reviewer username to a Bitbucket UUID.
+# Bitbucket needs UUIDs, not display names, in PR payloads.
+# ---------------------------------------------------------------------------
+resolve_reviewer_uuid() {
+  local username="$1"
+  local resp uuid
+
+  # Try workspace member lookup first
+  resp=$(curl -sS -w $'\n%{http_code}' \
+    -u "${BB_EMAIL}:${BB_TOKEN}" \
+    "${BB_API_BASE}/workspaces/${BB_WORKSPACE}/members/${username}") || return 1
+
+  local status="${resp##*$'\n'}"
+  local body="${resp%$'\n'*}"
+
+  if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+    uuid=$(printf '%s' "$body" | jq -r '.user.uuid // empty')
+    [ -n "$uuid" ] && printf '%s' "$uuid" && return 0
+  fi
+
+  # Fallback: search users
+  resp=$(curl -sS -w $'\n%{http_code}' \
+    -u "${BB_EMAIL}:${BB_TOKEN}" \
+    "${BB_API_BASE}/users/${username}") || return 1
+
+  status="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+
+  if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+    uuid=$(printf '%s' "$body" | jq -r '.uuid // empty')
+    [ -n "$uuid" ] && printf '%s' "$uuid" && return 0
+  fi
+
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# pr create
+# ---------------------------------------------------------------------------
+pr_create() {
+  local title="" body="" body_file="" dest="" draft=false reviewers_csv=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title)       title="$2";       shift 2 ;;
+      --body)        body="$2";        shift 2 ;;
+      --body-file)   body_file="$2";   shift 2 ;;
+      --dest)        dest="$2";        shift 2 ;;
+      --draft)       draft=true;       shift   ;;
+      --reviewers)   reviewers_csv="$2"; shift 2 ;;
+      *) echo "unknown flag: $1" >&2; usage_pr; exit 1 ;;
+    esac
+  done
+
+  [ -n "$title" ] || { echo "error: --title is required" >&2; exit 1; }
+
+  local source_branch
+  source_branch=$(git branch --show-current)
+  [ -n "$source_branch" ] || { echo "error: could not determine current branch (detached HEAD?)" >&2; exit 1; }
+
+  if [ -n "$body_file" ]; then
+    [ -f "$body_file" ] || { echo "error: body file not found: $body_file" >&2; exit 1; }
+    body=$(< "$body_file")
+  fi
+
+  if [ -z "$dest" ]; then
+    dest=$(get_default_branch)
+  fi
+
+  # Build reviewers JSON array — resolve each username to UUID
+  local reviewers_json="[]"
+  if [ -n "$reviewers_csv" ]; then
+    local uuids_arr="[]"
+    IFS=',' read -ra reviewer_names <<< "$reviewers_csv"
+    for name in "${reviewer_names[@]}"; do
+      name="${name// /}"  # trim spaces
+      local uuid
+      if uuid=$(resolve_reviewer_uuid "$name"); then
+        # Bitbucket UUID includes curly braces: {uuid}
+        uuids_arr=$(printf '%s' "$uuids_arr" | jq --arg u "$uuid" '. + [{"uuid": $u}]')
+      else
+        echo "warning: could not resolve reviewer '$name' — skipping" >&2
+      fi
+    done
+    reviewers_json="$uuids_arr"
+  fi
+
+  # Build payload using jq so user input is never string-concatenated into JSON
+  local payload
+  payload=$(jq -n \
+    --arg title   "$title" \
+    --arg desc    "$body" \
+    --arg src     "$source_branch" \
+    --arg dst     "$dest" \
+    --argjson draft "$draft" \
+    --argjson reviewers "$reviewers_json" \
+    '{
+      title:       $title,
+      description: $desc,
+      source:      {branch: {name: $src}},
+      destination: {branch: {name: $dst}},
+      draft:       $draft,
+      reviewers:   $reviewers
+    }')
+
+  local resp
+  resp=$(bb_api POST "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests" \
+    --data "$payload")
+
+  local pr_id pr_url pr_state
+  IFS=$'\t' read -r pr_id pr_url pr_state <<<"$(printf '%s' "$resp" \
+    | jq -r '[.id, .links.html.href, .state] | @tsv')"
+
+  printf '%bPR #%s created%b (%s)\n' "$C_BOLD" "$pr_id" "$C_RESET" "$(colorize_state "$pr_state")"
+  printf 'Title:  %s\n' "$title"
+  printf 'Branch: %s → %s\n' "$source_branch" "$dest"
+  printf 'URL:    %s\n' "$pr_url"
+}
+
+# ---------------------------------------------------------------------------
+# pr list
+# ---------------------------------------------------------------------------
+pr_list() {
+  local state="open" json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --state) state="$2"; shift 2 ;;
+      --mine)  echo "error: --mine is no longer supported (CHANGE-2770). Use --author USERNAME instead (coming v0.2)." >&2; exit 1 ;;
+      --json)  json_out=true; shift ;;
+      *) echo "unknown flag: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  local upper_state
+  upper_state=$(printf '%s' "$state" | tr '[:lower:]' '[:upper:]')
+
+  # States to query — "all" expands to all four states
+  local states_to_query
+  if [ "$upper_state" = "ALL" ]; then
+    states_to_query="OPEN MERGED DECLINED SUPERSEDED"
+  else
+    states_to_query="$upper_state"
+  fi
+
+  # Only first page for v0.1 — paginated API; first 50 results per state shown
+  local pages=()
+  for s in $states_to_query; do
+    local page_data
+    page_data=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests?state=${s}&pagelen=50")
+    pages+=("$(printf '%s' "$page_data" | jq -c '.values')")
+  done
+  local combined
+  combined=$(printf '%s\n' "${pages[@]}" | jq -s 'add // []')
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$combined"
+    return
+  fi
+
+  # Human-readable table: #ID  STATE  TITLE(truncated)  AUTHOR  SRC→DST
+  printf '%s' "$combined" | jq -r '.[] | [
+    (.id | tostring),
+    .state,
+    (.title | if length > 45 then .[0:45] + "…" else . end),
+    .author.display_name,
+    (.source.branch.name + " → " + .destination.branch.name)
+  ] | @tsv' | while IFS=$'\t' read -r pr_id st title author branches; do
+    printf '%b#%-5s%b  %-12s  %-48s  %-20s  %s\n' \
+      "$C_BOLD" "$pr_id" "$C_RESET" \
+      "$(colorize_state "$st")" \
+      "$title" \
+      "$author" \
+      "$branches"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# pr view
+# ---------------------------------------------------------------------------
+pr_view() {
+  local pr_id="" json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json_out=true; shift ;;
+      -*)     echo "unknown flag: $1" >&2; exit 1 ;;
+      *)      pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || { echo "error: PR id is required" >&2; exit 1; }
+
+  local resp
+  resp=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}")
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$resp"
+    return
+  fi
+
+  # Single @tsv pass for one-line fields; description stays separate (may be multiline)
+  local title state author src dst web_url reviewers description
+  IFS=$'\t' read -r title state author src dst web_url reviewers <<<"$(printf '%s' "$resp" \
+    | jq -r '[.title, .state, .author.display_name, .source.branch.name, .destination.branch.name, .links.html.href, ([.reviewers[]?.display_name] | join(", "))] | @tsv')"
+  description=$(printf '%s' "$resp" | jq -r '.description // ""')
+
+  printf '%b#%s — %s%b\n' "$C_BOLD" "$pr_id" "$title" "$C_RESET"
+  printf 'State:     %s\n' "$(colorize_state "$state")"
+  printf 'Author:    %s\n' "$author"
+  printf 'Branch:    %s → %s\n' "$src" "$dst"
+  printf 'Reviewers: %s\n' "${reviewers:-none}"
+  printf 'URL:       %s\n' "$web_url"
+  if [ -n "$description" ]; then
+    printf '\nDescription:\n%s\n' "$description"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# pr comment
+# ---------------------------------------------------------------------------
+pr_comment() {
+  local pr_id="" body="" body_file=""
+
+  # First non-flag arg is the PR id
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --body)      body="$2";      shift 2 ;;
+      --body-file) body_file="$2"; shift 2 ;;
+      -*)          echo "unknown flag: $1" >&2; exit 1 ;;
+      *)           pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || { echo "error: PR id is required" >&2; exit 1; }
+
+  if [ -n "$body_file" ]; then
+    [ -f "$body_file" ] || { echo "error: body file not found: $body_file" >&2; exit 1; }
+    body=$(< "$body_file")
+  fi
+
+  [ -n "$body" ] || { echo "error: --body or --body-file is required" >&2; exit 1; }
+
+  local payload
+  payload=$(jq -n --arg text "$body" '{"content": {"raw": $text}}')
+
+  local resp
+  resp=$(bb_api POST "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}/comments" \
+    --data "$payload")
+
+  local comment_id
+  comment_id=$(printf '%s' "$resp" | jq -r '.id')
+  printf 'Comment #%s posted on PR #%s\n' "$comment_id" "$pr_id"
+}
+
+# ---------------------------------------------------------------------------
+# pr diff — raw diff text, not JSON
+# ---------------------------------------------------------------------------
+pr_diff() {
+  local pr_id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*)  echo "unknown flag: $1" >&2; exit 1 ;;
+      *)   pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || _die "PR id is required"
+
+  # Diff endpoint returns text/plain — bb_api_raw skips the JSON Content-Type
+  printf '%s\n' "$(bb_api_raw GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}/diff")"
+}
+
+# ---------------------------------------------------------------------------
+# pr checks — build statuses
+# ---------------------------------------------------------------------------
+pr_checks() {
+  local pr_id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*)  echo "unknown flag: $1" >&2; exit 1 ;;
+      *)   pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || { echo "error: PR id is required" >&2; exit 1; }
+
+  local resp
+  resp=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}/statuses")
+
+  printf '%s' "$resp" | jq -r '.values[] | [.state, .name, .url] | @tsv' \
+  | while IFS=$'\t' read -r st name url; do
+    local color
+    case "$st" in
+      SUCCESSFUL) color="$C_GREEN"  ;;
+      FAILED)     color="$C_RED"    ;;
+      INPROGRESS) color="$C_YELLOW" ;;
+      *)          color="$C_GRAY"   ;;
+    esac
+    printf '%b%-12s%b  %-40s  %s\n' "$color" "$st" "$C_RESET" "$name" "$url"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# pr open — open PR URL in system browser
+# ---------------------------------------------------------------------------
+pr_open() {
+  local pr_id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*)  echo "unknown flag: $1" >&2; exit 1 ;;
+      *)   pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || _die "PR id is required"
+
+  local pr_url="https://bitbucket.org/${BB_WORKSPACE}/${BB_REPO}/pull-requests/${pr_id}"
+  _open_url "$pr_url"
+  printf 'Opened: %s\n' "$pr_url"
+}
+
+# ---------------------------------------------------------------------------
+# pr dispatch
+# ---------------------------------------------------------------------------
+pr_dispatch() {
+  local subcmd="${1:-}"
+  [ -n "$subcmd" ] || { usage_pr; exit 1; }
+  shift
+
+  detect_repo
+  load_creds
+
+  case "$subcmd" in
+    create)  pr_create  "$@" ;;
+    list)    pr_list    "$@" ;;
+    view)    pr_view    "$@" ;;
+    comment) pr_comment "$@" ;;
+    diff)    pr_diff    "$@" ;;
+    checks)  pr_checks  "$@" ;;
+    open)    pr_open    "$@" ;;
+    *)
+      echo "error: unknown pr subcommand '$subcmd'" >&2
+      usage_pr
+      exit 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage_pr() {
+  cat >&2 <<'EOF'
+Usage:
+  bb pr create   --title TITLE [--body BODY | --body-file FILE] [--dest BRANCH] [--draft] [--reviewers user1,user2]
+  bb pr list     [--state open|merged|declined|all] [--json]
+  bb pr view     <id> [--json]
+  bb pr comment  <id> (--body BODY | --body-file FILE)
+  bb pr diff     <id>
+  bb pr checks   <id>
+  bb pr open     <id>
+EOF
+}
+
+usage_auth() {
+  cat >&2 <<'EOF'
+Usage:
+  bb auth login    Interactive token setup
+  bb auth status   Verify current credentials
+  bb auth logout   Remove saved credentials
+EOF
+}
+
+usage_main() {
+  cat <<EOF
+bb — gh-style CLI for Bitbucket Cloud  (v${VERSION})
+
+Usage:
+  bb <command> [subcommand] [flags]
+  bb help
+  bb version
+
+Auth subcommands:
+  login    Interactive token setup
+  status   Verify current credentials
+  logout   Remove saved credentials
+
+PR subcommands:
+  create   Open a new pull request
+  list     List pull requests
+  view     Show PR details
+  comment  Post a comment on a PR
+  diff     Show PR diff
+  checks   Show PR build statuses
+  open     Open PR in browser
+
+Note (v0.1):
+  List commands show the first 50 results only (no pagination yet).
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main entrypoint
+# ---------------------------------------------------------------------------
+cmd="${1:-}"
+[ -n "$cmd" ] || { usage_main; exit 0; }
+shift
+
+# Fast paths — version/help shouldn't pay for dependency probes
+case "$cmd" in
+  help)    usage_main; exit 0 ;;
+  version) printf '%s\n' "$VERSION"; exit 0 ;;
+esac
+
+check_deps
+
+case "$cmd" in
+  pr)      pr_dispatch   "$@" ;;
+  auth)    auth_dispatch "$@" ;;
+  *)
+    echo "error: unknown command '$cmd'" >&2
+    usage_main >&2
+    exit 1
+    ;;
+esac
