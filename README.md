@@ -79,6 +79,7 @@ bb pr open 42
 | `bb pr diff <id>` | Show raw diff |
 | `bb pr checks <id>` | Show build statuses |
 | `bb pr open <id>` | Open PR URL in browser |
+| `bb pr merge <id> [--merge\|--squash\|--fast-forward] [--delete-branch] [--message MSG] [--json]` | Merge a pull request |
 | `bb help` | Show usage |
 | `bb version` | Print version |
 

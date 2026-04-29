@@ -637,6 +637,69 @@ pr_open() {
 }
 
 # ---------------------------------------------------------------------------
+# pr merge
+# ---------------------------------------------------------------------------
+pr_merge() {
+  local pr_id="" strategy="merge_commit" strategy_set=false
+  local close_branch=false message="" json_out=false
+  local mutex_err="strategy flags are mutually exclusive (--merge, --squash, --fast-forward)"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --merge)
+        [ "$strategy_set" = true ] && _die "$mutex_err"
+        strategy="merge_commit"; strategy_set=true; shift ;;
+      --squash)
+        [ "$strategy_set" = true ] && _die "$mutex_err"
+        strategy="squash"; strategy_set=true; shift ;;
+      --fast-forward)
+        [ "$strategy_set" = true ] && _die "$mutex_err"
+        strategy="fast_forward"; strategy_set=true; shift ;;
+      --delete-branch) close_branch=true; shift ;;
+      --message)       message="$2"; shift 2 ;;
+      --json)          json_out=true; shift ;;
+      -*)              echo "unknown flag: $1" >&2; exit 1 ;;
+      *)               pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || { echo "error: PR id is required" >&2; exit 1; }
+
+  # Reject non-OPEN PRs client-side so users get the actual state, not a 405.
+  local preflight
+  preflight=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}")
+
+  local pr_state src dst web_url
+  IFS=$'\t' read -r pr_state src dst web_url <<<"$(printf '%s' "$preflight" \
+    | jq -r '[.state, .source.branch.name, .destination.branch.name, .links.html.href] | @tsv')"
+
+  [ "$pr_state" = "OPEN" ] || _die "PR #${pr_id} cannot be merged — current state: ${pr_state}"
+
+  local payload
+  payload=$(jq -n \
+    --arg     type     "pullrequest_merge_parameters" \
+    --arg     strategy "$strategy" \
+    --argjson close    "$close_branch" \
+    --arg     msg      "$message" \
+    '{type: $type, merge_strategy: $strategy, close_source_branch: $close}
+     + (if $msg == "" then {} else {message: $msg} end)')
+
+  local resp
+  resp=$(bb_api POST "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}/merge" \
+    --data "$payload")
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$resp"
+    return
+  fi
+
+  printf '%bPR #%s merged%b (%s)\n' "$C_BOLD" "$pr_id" "$C_RESET" "$(colorize_state "MERGED")"
+  printf 'Strategy: %s\n' "$strategy"
+  printf 'Branch:   %s → %s\n' "$src" "$dst"
+  printf 'URL:      %s\n' "$web_url"
+}
+
+# ---------------------------------------------------------------------------
 # pr dispatch
 # ---------------------------------------------------------------------------
 pr_dispatch() {
@@ -655,6 +718,7 @@ pr_dispatch() {
     diff)    pr_diff    "$@" ;;
     checks)  pr_checks  "$@" ;;
     open)    pr_open    "$@" ;;
+    merge)   pr_merge   "$@" ;;
     *)
       echo "error: unknown pr subcommand '$subcmd'" >&2
       usage_pr
@@ -676,6 +740,7 @@ Usage:
   bb pr diff     <id>
   bb pr checks   <id>
   bb pr open     <id>
+  bb pr merge    <id> [--merge|--squash|--fast-forward] [--delete-branch] [--message MSG] [--json]
 EOF
 }
 
@@ -710,6 +775,7 @@ PR subcommands:
   diff     Show PR diff
   checks   Show PR build statuses
   open     Open PR in browser
+  merge    Merge a pull request
 
 Note (v0.1):
   List commands show the first 50 results only (no pagination yet).
