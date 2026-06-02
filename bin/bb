@@ -700,6 +700,46 @@ pr_merge() {
 }
 
 # ---------------------------------------------------------------------------
+# pr decline
+# ---------------------------------------------------------------------------
+pr_decline() {
+  local pr_id="" json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json_out=true; shift ;;
+      -*)     echo "unknown flag: $1" >&2; exit 1 ;;
+      *)      pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || { echo "error: PR id is required" >&2; exit 1; }
+
+  # Reject non-OPEN PRs client-side so users get the actual state, not a 405.
+  local preflight
+  preflight=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}")
+
+  local pr_state src dst web_url
+  IFS=$'\t' read -r pr_state src dst web_url <<<"$(printf '%s' "$preflight" \
+    | jq -r '[.state, .source.branch.name, .destination.branch.name, .links.html.href] | @tsv')"
+
+  [ "$pr_state" = "OPEN" ] || _die "PR #${pr_id} cannot be declined — current state: ${pr_state}"
+
+  local resp
+  resp=$(bb_api POST "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}/decline" \
+    --data '{}')
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$resp"
+    return
+  fi
+
+  printf '%bPR #%s declined%b (%s)\n' "$C_BOLD" "$pr_id" "$C_RESET" "$(colorize_state "DECLINED")"
+  printf 'Branch:   %s → %s\n' "$src" "$dst"
+  printf 'URL:      %s\n' "$web_url"
+}
+
+# ---------------------------------------------------------------------------
 # pr dispatch
 # ---------------------------------------------------------------------------
 pr_dispatch() {
@@ -719,6 +759,7 @@ pr_dispatch() {
     checks)  pr_checks  "$@" ;;
     open)    pr_open    "$@" ;;
     merge)   pr_merge   "$@" ;;
+    decline) pr_decline "$@" ;;
     *)
       echo "error: unknown pr subcommand '$subcmd'" >&2
       usage_pr
@@ -741,6 +782,7 @@ Usage:
   bb pr checks   <id>
   bb pr open     <id>
   bb pr merge    <id> [--merge|--squash|--fast-forward] [--delete-branch] [--message MSG] [--json]
+  bb pr decline  <id> [--json]
 EOF
 }
 
@@ -776,6 +818,7 @@ PR subcommands:
   checks   Show PR build statuses
   open     Open PR in browser
   merge    Merge a pull request
+  decline  Decline a pull request
 
 Note (v0.1):
   List commands show the first 50 results only (no pagination yet).
