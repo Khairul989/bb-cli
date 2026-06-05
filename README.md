@@ -81,6 +81,7 @@ bb pr open 42
 | `bb pr open <id>` | Open PR URL in browser |
 | `bb pr merge <id> [--merge\|--squash\|--fast-forward] [--delete-branch] [--message MSG] [--json]` | Merge a pull request |
 | `bb pr decline <id> [--json]` | Decline a pull request |
+| `bb pr reviewers <id> [--add user1,user2] [--remove user3] [--set user1,user2]` | Manage reviewers on an existing PR |
 | `bb help` | Show usage |
 | `bb version` | Print version |
 
