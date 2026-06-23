@@ -72,7 +72,7 @@ bb pr open 42
 | `bb auth login` | Interactive token setup |
 | `bb auth status` | Verify current credentials and show user identity |
 | `bb auth logout` | Remove saved credentials from `~/.config/bb/config` |
-| `bb pr create --title TITLE [--body BODY \| --body-file FILE] [--dest BRANCH] [--draft] [--reviewers user1,user2]` | Open a new pull request |
+| `bb pr create --title TITLE [--body BODY \| --body-file FILE] [--dest BRANCH] [--draft] [--reviewers user1,user2] [--fill] [--web]` | Open a new pull request |
 | `bb pr list [--state open\|merged\|declined\|all] [--json]` | List pull requests |
 | `bb pr view <id> [--json]` | Show PR details |
 | `bb pr comment <id> (--body BODY \| --body-file FILE)` | Post a comment |
@@ -86,19 +86,29 @@ bb pr open 42
 | `bb pr request-changes <id> [--undo] [--json]` | Request changes on a PR (or remove with `--undo`) |
 | `bb pr checkout <id> [--branch NAME]` | Check out the PR source branch locally |
 | `bb pr edit <id> [--title T] [--body B \| --body-file F] [--dest BRANCH] [--reviewers user1,user2]` | Edit PR title, description, destination, or reviewers |
+| `bb pr status [--json]` | Show open PR(s) for current branch with reviewer approval state |
+| `bb pr commits <id> [--json]` | List commits in a pull request |
+| `bb pr files <id> [--json]` | List files changed in a pull request |
 | `bb api <METHOD> <PATH> [--data JSON \| --input FILE] [--json]` | Call any Bitbucket API endpoint directly |
+| `bb repo view [ws/repo] [--json]` | Show repository details (defaults to current repo) |
+| `bb repo list [ws] [--json]` | List repositories in a workspace |
+| `bb repo clone <ws/repo> [--ssh]` | Clone a repository (HTTPS by default, `--ssh` for SSH URL) |
+| `bb repo create <name> [--workspace WS] [--private] [--project KEY] [--description D] [--yes]` | Create a new repository (prompts for confirmation) |
+| `bb browse [path] [--branch B]` | Open repo (or file path) in browser |
 | `bb help` | Show usage |
 | `bb version` | Print version |
 
 ### Flags
 
 **`bb pr create`**
-- `--title` — PR title (required)
+- `--title` — PR title (required unless `--fill` or `--web`)
 - `--body` — PR description (inline)
 - `--body-file` — PR description from file
 - `--dest` — destination branch (defaults to repo mainbranch from API)
 - `--draft` — mark PR as draft
 - `--reviewers` — comma-separated Bitbucket usernames
+- `--fill` — derive title from latest commit subject; derive body from `git log <dest>..HEAD`
+- `--web` — open the Bitbucket compare page in browser instead of creating via API
 
 **`bb pr list`**
 - `--state` — filter by state: `open` (default), `merged`, `declined`, `all`

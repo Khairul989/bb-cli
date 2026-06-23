@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 BB_API_BASE="https://api.bitbucket.org/2.0"
 BB_CONFIG_FILE="$HOME/.config/bb/config"
 
@@ -387,20 +387,21 @@ resolve_reviewer_uuid() {
 # ---------------------------------------------------------------------------
 pr_create() {
   local title="" body="" body_file="" dest="" draft=false reviewers_csv=""
+  local fill=false web=false has_title=false has_body=false
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --title)       title="$2";       shift 2 ;;
-      --body)        body="$2";        shift 2 ;;
-      --body-file)   body_file="$2";   shift 2 ;;
-      --dest)        dest="$2";        shift 2 ;;
-      --draft)       draft=true;       shift   ;;
-      --reviewers)   reviewers_csv="$2"; shift 2 ;;
+      --title)       title="$2";          has_title=true; shift 2 ;;
+      --body)        body="$2";           has_body=true;  shift 2 ;;
+      --body-file)   body_file="$2";      has_body=true;  shift 2 ;;
+      --dest)        dest="$2";           shift 2 ;;
+      --draft)       draft=true;          shift   ;;
+      --reviewers)   reviewers_csv="$2";  shift 2 ;;
+      --fill)        fill=true;           shift   ;;
+      --web)         web=true;            shift   ;;
       *) echo "unknown flag: $1" >&2; usage_pr; exit 1 ;;
     esac
   done
-
-  [ -n "$title" ] || { echo "error: --title is required" >&2; exit 1; }
 
   local source_branch
   source_branch=$(git branch --show-current)
@@ -414,6 +415,29 @@ pr_create() {
   if [ -z "$dest" ]; then
     dest=$(get_default_branch)
   fi
+
+  # --fill: derive title from latest commit subject, body from commit log since dest
+  if [ "$fill" = true ]; then
+    if [ "$has_title" = false ]; then
+      title=$(git log -1 --format=%s)
+    fi
+    if [ "$has_body" = false ]; then
+      body=$(git log "${dest}..HEAD" --format='- %s')
+    fi
+  fi
+
+  # --web: open Bitbucket compare page in browser instead of POSTing
+  if [ "$web" = true ]; then
+    local encoded_src encoded_dst
+    encoded_src=$(jq -rn --arg b "$source_branch" '@uri $b')
+    encoded_dst=$(jq -rn --arg b "$dest" '@uri $b')
+    local web_url="https://bitbucket.org/${BB_WORKSPACE}/${BB_REPO}/pull-requests/new?source=${encoded_src}&dest=${encoded_dst}"
+    _open_url "$web_url"
+    printf '%s\n' "$web_url"
+    return
+  fi
+
+  [ -n "$title" ] || { echo "error: --title is required (or use --fill to derive from commits)" >&2; exit 1; }
 
   # Build reviewers JSON array — resolve each username to UUID
   local reviewers_json="[]"
@@ -1130,6 +1154,442 @@ api_cmd() {
 }
 
 # ---------------------------------------------------------------------------
+# pr status — show open PR(s) for current branch with reviewer approval summary
+# ---------------------------------------------------------------------------
+pr_status() {
+  local json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json_out=true; shift ;;
+      -*)     _die "unknown flag: $1" ;;
+      *)      _die "unexpected argument: $1" ;;
+    esac
+  done
+
+  local branch
+  branch=$(git branch --show-current)
+  [ -n "$branch" ] || _die "not on a branch (detached HEAD?)"
+
+  # URL-encode the q filter: source.branch.name="<branch>"
+  local q_encoded
+  q_encoded=$(jq -rn --arg b "$branch" '@uri "source.branch.name=\"\($b)\""')
+
+  local base_path="/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests"
+
+  # Try server-side q filter first (avoid fetching all PRs); fall back to
+  # client-side filter on non-2xx so this works even when q syntax is unsupported.
+  local raw status body values
+  raw=$(curl -sS -w $'\n%{http_code}' \
+    -H "Content-Type: application/json" \
+    -u "${BB_EMAIL}:${BB_TOKEN}" \
+    "${BB_API_BASE}${base_path}?q=${q_encoded}&state=OPEN&pagelen=50") \
+    || _die "curl failed (network error or bad TLS)"
+  status="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+
+  if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+    values=$(printf '%s' "$body" | jq -c '.values')
+  else
+    # q-filter rejected — fetch all OPEN PRs and filter client-side
+    _warn "q-filter returned $status — using client-side branch filter"
+    body=$(bb_api GET "${base_path}?state=OPEN&pagelen=50")
+    values=$(printf '%s' "$body" | jq -c --arg b "$branch" '[.values[] | select(.source.branch.name == $b)]')
+  fi
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$values"
+    return
+  fi
+
+  local count
+  count=$(printf '%s' "$values" | jq 'length')
+  if [ "$count" -eq 0 ]; then
+    printf "No open PR for branch '%s'.\n" "$branch"
+    return 0
+  fi
+
+  # Print PR summary + per-reviewer approval state
+  # Encode reviewers as "name|state" pairs joined by ";" so we can post-process in shell
+  printf '%s' "$values" | jq -r '.[] | [
+    (.id | tostring),
+    .state,
+    (.title | if length > 55 then .[0:55] + "…" else . end),
+    ([.participants[] | select(.role == "REVIEWER") |
+      "\(.user.display_name)|\(if .approved then "approved" elif .state == "changes_requested" then "changes_requested" else "pending" end)"
+    ] | join(";"))
+  ] | @tsv' | while IFS=$'\t' read -r pr_id st title reviewers; do
+    printf '%b#%-5s%b  %-12s  %s\n' "$C_BOLD" "$pr_id" "$C_RESET" "$(colorize_state "$st")" "$title"
+    if [ -n "$reviewers" ]; then
+      IFS=';' read -ra rv_arr <<< "$reviewers"
+      for rv in "${rv_arr[@]}"; do
+        rv_name="${rv%%|*}"
+        rv_st="${rv##*|}"
+        case "$rv_st" in
+          approved)           mark="✓" ;;
+          changes_requested)  mark="✗" ;;
+          *)                  mark="?" ;;
+        esac
+        printf '  %s %s\n' "$mark" "$rv_name"
+      done
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# pr commits — list commits in a pull request
+# ---------------------------------------------------------------------------
+pr_commits() {
+  local pr_id="" json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json_out=true; shift ;;
+      -*)     _die "unknown flag: $1" ;;
+      *)      pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || { echo "error: PR id is required" >&2; exit 1; }
+
+  local resp
+  resp=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}/commits")
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$(printf '%s' "$resp" | jq -c '.values')"
+    return
+  fi
+
+  printf '%s' "$resp" | jq -r '.values[] | [
+    .hash[0:7],
+    (.author.user.display_name // (.author.raw | gsub(" <.*>$"; ""))),
+    (.message | split("\n")[0] | if length > 60 then .[0:60] + "…" else . end)
+  ] | @tsv' | while IFS=$'\t' read -r hash author msg; do
+    printf '%b%s%b  %-25s  %s\n' "$C_GRAY" "$hash" "$C_RESET" "$author" "$msg"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# pr files — list files changed in a pull request (diffstat)
+# ---------------------------------------------------------------------------
+pr_files() {
+  local pr_id="" json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json_out=true; shift ;;
+      -*)     _die "unknown flag: $1" ;;
+      *)      pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || { echo "error: PR id is required" >&2; exit 1; }
+
+  local resp
+  resp=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}/diffstat?pagelen=100")
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$(printf '%s' "$resp" | jq -c '.values')"
+    return
+  fi
+
+  printf '%s' "$resp" | jq -r '.values[] | [
+    .status,
+    ("+\(.lines_added // 0)/-\(.lines_removed // 0)"),
+    (.new.path // .old.path)
+  ] | @tsv' | while IFS=$'\t' read -r status changes path; do
+    case "$status" in
+      added)   color="$C_GREEN" ;;
+      removed) color="$C_RED"   ;;
+      *)       color="$C_RESET" ;;
+    esac
+    printf '%b%-10s%b  %-14s  %s\n' "$color" "$status" "$C_RESET" "$changes" "$path"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# repo view — show repository details
+# ---------------------------------------------------------------------------
+repo_view() {
+  local ws="" repo_slug="" json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json_out=true; shift ;;
+      -*)     _die "unknown flag: $1" ;;
+      *)
+        if [[ "$1" == */* ]]; then
+          ws="${1%%/*}"
+          repo_slug="${1#*/}"
+        else
+          _die "expected <workspace/repo>, got: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  # Fall back to current repo when no arg given
+  if [ -z "$ws" ]; then
+    detect_repo
+    ws="$BB_WORKSPACE"
+    repo_slug="$BB_REPO"
+  fi
+
+  local resp
+  resp=$(bb_api GET "/repositories/${ws}/${repo_slug}")
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$resp"
+    return
+  fi
+
+  local full_name desc vis mainbranch size updated_on web_url
+  IFS=$'\t' read -r full_name desc vis mainbranch size updated_on web_url <<<"$(printf '%s' "$resp" \
+    | jq -r '[
+        .full_name,
+        (.description // "—"),
+        (if .is_private then "private" else "public" end),
+        (.mainbranch.name // "—"),
+        (.size | tostring),
+        .updated_on,
+        .links.html.href
+      ] | @tsv')"
+
+  printf '%b%s%b\n' "$C_BOLD" "$full_name" "$C_RESET"
+  printf 'Description:  %s\n' "$desc"
+  printf 'Visibility:   %s\n' "$vis"
+  printf 'Main branch:  %s\n' "$mainbranch"
+  printf 'Size:         %s bytes\n' "$size"
+  printf 'Updated:      %s\n' "$updated_on"
+  printf 'URL:          %s\n' "$web_url"
+}
+
+# ---------------------------------------------------------------------------
+# repo list — list repositories in a workspace
+# ---------------------------------------------------------------------------
+repo_list() {
+  local ws="" json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json_out=true; shift ;;
+      -*)     _die "unknown flag: $1" ;;
+      *)      ws="$1"; shift ;;
+    esac
+  done
+
+  # Workspace: arg → try_detect → die
+  if [ -z "$ws" ]; then
+    if try_detect_workspace_slug; then
+      ws="$DETECTED_WORKSPACE"
+    else
+      _die "workspace required: bb repo list <workspace>"
+    fi
+  fi
+
+  local resp
+  resp=$(bb_api GET "/repositories/${ws}?pagelen=50&role=member&sort=-updated_on")
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$(printf '%s' "$resp" | jq -c '.values')"
+    return
+  fi
+
+  printf '%s' "$resp" | jq -r '.values[] | [
+    .full_name,
+    (if .is_private then "private" else "public" end),
+    (.updated_on[0:10]),
+    (.description // "" | if length > 40 then .[0:40] + "…" else . end)
+  ] | @tsv' | while IFS=$'\t' read -r full_name vis updated desc; do
+    printf '%-45s  %-8s  %-12s  %s\n' "$full_name" "$vis" "$updated" "$desc"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# repo clone — clone a repository by workspace/repo slug
+# ---------------------------------------------------------------------------
+repo_clone() {
+  local ws="" repo_slug="" use_ssh=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ssh)  use_ssh=true; shift ;;
+      -*)     _die "unknown flag: $1" ;;
+      *)
+        if [[ "$1" == */* ]]; then
+          ws="${1%%/*}"
+          repo_slug="${1#*/}"
+        else
+          _die "expected <workspace/repo>, got: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [ -n "$ws" ] || _die "workspace/repo is required: bb repo clone <workspace/repo>"
+
+  local resp
+  resp=$(bb_api GET "/repositories/${ws}/${repo_slug}")
+
+  local clone_url
+  if [ "$use_ssh" = true ]; then
+    clone_url=$(printf '%s' "$resp" | jq -r '.links.clone[] | select(.name == "ssh") | .href')
+  else
+    clone_url=$(printf '%s' "$resp" | jq -r '.links.clone[] | select(.name == "https") | .href')
+  fi
+
+  [ -n "$clone_url" ] || _die "could not find clone URL for ${ws}/${repo_slug}"
+
+  printf 'Cloning %s\n' "$clone_url"
+  git clone "$clone_url"
+}
+
+# ---------------------------------------------------------------------------
+# repo create — create a new repository in a workspace (mutates remote;
+# prompts for confirmation unless --yes/-y is passed for scripting)
+# ---------------------------------------------------------------------------
+repo_create() {
+  local name="" ws="" project_key="" description="" is_private=false yes=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --workspace)   ws="$2";           shift 2 ;;
+      --private)     is_private=true;   shift   ;;
+      --project)     project_key="$2";  shift 2 ;;
+      --description) description="$2";  shift 2 ;;
+      --yes|-y)      yes=true;          shift   ;;
+      -*)            _die "unknown flag: $1" ;;
+      *)
+        [ -z "$name" ] || _die "unexpected argument: $1"
+        name="$1"; shift
+        ;;
+    esac
+  done
+
+  [ -n "$name" ] || _die "repo name is required: bb repo create <name> [--workspace WS]"
+
+  # Workspace: --workspace → try_detect → die
+  if [ -z "$ws" ]; then
+    if try_detect_workspace_slug; then
+      ws="$DETECTED_WORKSPACE"
+    else
+      _die "workspace required: use --workspace WS"
+    fi
+  fi
+
+  # Confirmation prompt (unless --yes/-y skips for scripting)
+  if [ "$yes" = false ]; then
+    local vis_label
+    vis_label=$([ "$is_private" = true ] && echo "private" || echo "public")
+    local proj_label=""
+    [ -n "$project_key" ] && proj_label="  project=${project_key}"
+    printf 'Will create: %s/%s (%s)%s\n' "$ws" "$name" "$vis_label" "$proj_label"
+    printf 'Create this repository? [y/N]: '
+    read -r reply
+    if ! printf '%s' "$reply" | grep -qE '^[Yy]$'; then
+      echo "Aborted."
+      return
+    fi
+  fi
+
+  # Build payload with jq — never string-concat user input into JSON
+  local payload
+  payload=$(jq -n \
+    --arg     scm     "git" \
+    --argjson private "$is_private" \
+    --arg     desc    "$description" \
+    --arg     proj    "$project_key" \
+    '{scm: $scm, is_private: $private}
+     + (if $desc != "" then {description: $desc} else {} end)
+     + (if $proj != "" then {project: {key: $proj}} else {} end)')
+
+  local resp
+  resp=$(bb_api POST "/repositories/${ws}/${name}" --data "$payload")
+
+  local full_name clone_url web_url
+  full_name=$(printf '%s' "$resp" | jq -r '.full_name')
+  clone_url=$(printf '%s' "$resp" | jq -r '.links.clone[] | select(.name == "https") | .href')
+  web_url=$(printf '%s' "$resp"   | jq -r '.links.html.href')
+
+  printf '%bRepository created%b\n' "$C_BOLD" "$C_RESET"
+  printf 'Name:  %s\n' "$full_name"
+  printf 'URL:   %s\n' "$web_url"
+  printf 'Clone: %s\n' "$clone_url"
+}
+
+# ---------------------------------------------------------------------------
+# repo dispatch
+# ---------------------------------------------------------------------------
+repo_dispatch() {
+  local subcmd="${1:-}"
+  [ -n "$subcmd" ] || { usage_repo; exit 1; }
+  shift
+
+  load_creds
+
+  case "$subcmd" in
+    view)   repo_view   "$@" ;;
+    list)   repo_list   "$@" ;;
+    clone)  repo_clone  "$@" ;;
+    create) repo_create "$@" ;;
+    *)
+      echo "error: unknown repo subcommand '$subcmd'" >&2
+      usage_repo
+      exit 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# browse — open the current repo (or a file path within it) in the browser
+# ---------------------------------------------------------------------------
+browse_cmd() {
+  local path="" branch=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch) branch="$2"; shift 2 ;;
+      -*)       _die "unknown flag: $1" ;;
+      *)        path="$1"; shift ;;
+    esac
+  done
+
+  load_creds
+  detect_repo
+
+  local url
+  if [ -z "$path" ]; then
+    url="https://bitbucket.org/${BB_WORKSPACE}/${BB_REPO}"
+  else
+    # Resolve branch: --branch → current git branch → repo default branch
+    if [ -z "$branch" ]; then
+      branch=$(git branch --show-current 2>/dev/null || true)
+    fi
+    if [ -z "$branch" ]; then
+      branch=$(get_default_branch)
+    fi
+
+    # URL-encode each path segment individually then rejoin with /
+    local encoded_path="" seg encoded_seg
+    IFS='/' read -ra path_segs <<< "$path"
+    for seg in "${path_segs[@]}"; do
+      encoded_seg=$(jq -rn --arg s "$seg" '@uri $s')
+      encoded_path="${encoded_path:+${encoded_path}/}${encoded_seg}"
+    done
+
+    local encoded_branch
+    encoded_branch=$(jq -rn --arg b "$branch" '@uri $b')
+
+    url="https://bitbucket.org/${BB_WORKSPACE}/${BB_REPO}/src/${encoded_branch}/${encoded_path}"
+  fi
+
+  _open_url "$url"
+  printf 'Opened: %s\n' "$url"
+}
+
+# ---------------------------------------------------------------------------
 # pr dispatch
 # ---------------------------------------------------------------------------
 pr_dispatch() {
@@ -1155,6 +1615,9 @@ pr_dispatch() {
     request-changes) pr_request_changes "$@" ;;
     checkout)        pr_checkout        "$@" ;;
     edit)            pr_edit            "$@" ;;
+    status)          pr_status          "$@" ;;
+    commits)         pr_commits         "$@" ;;
+    files)           pr_files           "$@" ;;
     *)
       echo "error: unknown pr subcommand '$subcmd'" >&2
       usage_pr
@@ -1169,7 +1632,7 @@ pr_dispatch() {
 usage_pr() {
   cat >&2 <<'EOF'
 Usage:
-  bb pr create   --title TITLE [--body BODY | --body-file FILE] [--dest BRANCH] [--draft] [--reviewers user1,user2]
+  bb pr create   --title TITLE [--body BODY | --body-file FILE] [--dest BRANCH] [--draft] [--reviewers user1,user2] [--fill] [--web]
   bb pr list     [--state open|merged|declined|all] [--json]
   bb pr view     <id> [--json]
   bb pr comment  <id> (--body BODY | --body-file FILE)
@@ -1183,6 +1646,9 @@ Usage:
   bb pr request-changes  <id> [--undo] [--json]
   bb pr checkout         <id> [--branch NAME]
   bb pr edit             <id> [--title T] [--body B | --body-file F] [--dest BRANCH] [--reviewers user1,user2]
+  bb pr status           [--json]
+  bb pr commits          <id> [--json]
+  bb pr files            <id> [--json]
 EOF
 }
 
@@ -1192,6 +1658,16 @@ Usage:
   bb auth login    Interactive token setup
   bb auth status   Verify current credentials
   bb auth logout   Remove saved credentials
+EOF
+}
+
+usage_repo() {
+  cat >&2 <<'EOF'
+Usage:
+  bb repo view   [ws/repo] [--json]
+  bb repo list   [ws] [--json]
+  bb repo clone  <ws/repo> [--ssh]
+  bb repo create <name> [--workspace WS] [--private] [--project KEY] [--description D] [--yes]
 EOF
 }
 
@@ -1210,7 +1686,7 @@ Auth subcommands:
   logout   Remove saved credentials
 
 PR subcommands:
-  create   Open a new pull request
+  create   Open a new pull request (--fill derives title/body from commits; --web opens browser)
   list     List pull requests
   view     Show PR details
   comment  Post a comment on a PR
@@ -1224,9 +1700,19 @@ PR subcommands:
   request-changes Request changes on a pull request
   checkout        Check out the PR source branch locally
   edit            Edit PR title, description, destination, or reviewers
+  status          Show open PR(s) for current branch with reviewer approval state
+  commits         List commits in a pull request
+  files           List files changed in a pull request
+
+Repo subcommands:
+  view     Show repository details
+  list     List repositories in a workspace
+  clone    Clone a repository
+  create   Create a new repository (prompts for confirmation)
 
 Other commands:
   api             Call any Bitbucket API endpoint directly
+  browse          Open the current repo (or a file path) in the browser
 
 Note (v0.1):
   List commands show the first 50 results only (no pagination yet).
@@ -1252,6 +1738,8 @@ case "$cmd" in
   pr)      pr_dispatch   "$@" ;;
   auth)    auth_dispatch "$@" ;;
   api)     api_cmd       "$@" ;;
+  repo)    repo_dispatch "$@" ;;
+  browse)  browse_cmd    "$@" ;;
   *)
     echo "error: unknown command '$cmd'" >&2
     usage_main >&2
