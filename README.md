@@ -94,7 +94,12 @@ bb pr open 42
 | `bb repo list [ws] [--json]` | List repositories in a workspace |
 | `bb repo clone <ws/repo> [--ssh]` | Clone a repository (HTTPS by default, `--ssh` for SSH URL) |
 | `bb repo create <name> [--workspace WS] [--private] [--project KEY] [--description D] [--yes]` | Create a new repository (prompts for confirmation) |
+| `bb pipeline list [--json]` | List recent pipelines (newest first) |
+| `bb pipeline view <id> [--json]` | Show pipeline details and step list (step UUIDs shown for use with `logs`) |
+| `bb pipeline logs <pipeline_id> <step_uuid>` | Fetch raw log output for a pipeline step |
+| `bb pipeline run [--branch B] [--pattern CUSTOM] [--yes]` | Trigger a pipeline (prompts for confirmation; `--yes` bypasses) |
 | `bb browse [path] [--branch B]` | Open repo (or file path) in browser |
+| `bb completion bash\|zsh` | Print shell completion script (source or eval) |
 | `bb help` | Show usage |
 | `bb version` | Print version |
 

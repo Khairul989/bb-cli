@@ -3,6 +3,15 @@
 All notable changes to `bb` are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is semver-ish.
 
+## [0.4.0] - 2026-06-23
+
+### Added — Pipelines + completion (Tier 4)
+- `bb pipeline list [--json]` — list recent pipelines (newest first, up to 20). Columns: build number, state/result (colored: green=SUCCESSFUL, red=FAILED, yellow=IN_PROGRESS/PENDING, gray=STOPPED/other), ref name, created date.
+- `bb pipeline view <id> [--json]` — show pipeline details (build number, state, result, ref, creator, created, duration) and a step table including step UUIDs (needed for `pipeline logs`).
+- `bb pipeline logs <pipeline_id> <step_uuid>` — fetch raw text/plain log for a pipeline step; uses `bb_api_raw` to bypass JSON Content-Type (same pattern as `pr diff`).
+- `bb pipeline run [--branch B] [--pattern CUSTOM] [--yes]` — trigger a pipeline; prompts for confirmation before POSTing; `--yes`/`-y` bypasses for scripting. Branch defaults to current git branch then repo mainbranch. `--pattern` triggers a named custom pipeline defined in `bitbucket-pipelines.yml`.
+- `bb completion bash|zsh` — print a static shell completion script to stdout for subcommand-level tab completion. Fast-path (no deps, no creds). Source or eval: `eval "$(bb completion bash)"`.
+
 ## [0.3.0] - 2026-06-23
 
 ### Added — PR visibility (Tier 2)

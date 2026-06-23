@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 BB_API_BASE="https://api.bitbucket.org/2.0"
 BB_CONFIG_FILE="$HOME/.config/bb/config"
 
@@ -1590,6 +1590,399 @@ browse_cmd() {
 }
 
 # ---------------------------------------------------------------------------
+# pipeline list — list recent pipelines for the current repo
+# ---------------------------------------------------------------------------
+pipeline_list() {
+  local json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json_out=true; shift ;;
+      -*)     _die "unknown flag: $1" ;;
+      *)      _die "unexpected argument: $1" ;;
+    esac
+  done
+
+  local resp
+  resp=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pipelines/?sort=-created_on&pagelen=20")
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$(printf '%s' "$resp" | jq -c '.values')"
+    return
+  fi
+
+  printf '%s' "$resp" | jq -r '.values[] | [
+    (.build_number | tostring),
+    (.state.name // "?"),
+    (.state.result.name // "—"),
+    (.target.ref_name // (.target.commit.hash[0:8] // "—")),
+    (.created_on[0:10])
+  ] | @tsv' | while IFS=$'\t' read -r build_num state result ref created; do
+    local color
+    case "$result" in
+      SUCCESSFUL) color="$C_GREEN"  ;;
+      FAILED)     color="$C_RED"    ;;
+      STOPPED)    color="$C_GRAY"   ;;
+      *)
+        case "$state" in
+          IN_PROGRESS|PENDING) color="$C_YELLOW" ;;
+          *)                   color="$C_GRAY"   ;;
+        esac
+        ;;
+    esac
+    local label
+    if [ "$result" != "—" ]; then
+      label="${state}/${result}"
+    else
+      label="$state"
+    fi
+    printf '%b#%-6s%b  %-30s  %-25s  %s\n' \
+      "$C_BOLD" "$build_num" "$C_RESET" \
+      "$(printf '%b%s%b' "$color" "$label" "$C_RESET")" \
+      "$ref" "$created"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# pipeline view — show pipeline details and its steps
+# ---------------------------------------------------------------------------
+pipeline_view() {
+  local id="" json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json_out=true; shift ;;
+      -*)     _die "unknown flag: $1" ;;
+      *)      id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$id" ] || _die "pipeline id or build number is required"
+
+  local resp
+  resp=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pipelines/${id}")
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$resp"
+    return
+  fi
+
+  local build_num state result ref creator created duration
+  IFS=$'\t' read -r build_num state result ref creator created duration <<<"$(printf '%s' "$resp" \
+    | jq -r '[
+        (.build_number | tostring),
+        (.state.name // "?"),
+        (.state.result.name // "—"),
+        (.target.ref_name // "—"),
+        (.creator.display_name // "—"),
+        (.created_on // "—"),
+        ((.duration_in_seconds // "—") | tostring)
+      ] | @tsv')"
+
+  printf '%bPipeline #%s%b\n' "$C_BOLD" "$build_num" "$C_RESET"
+  printf 'State:    %s\n' "$state"
+  printf 'Result:   %s\n' "$result"
+  printf 'Ref:      %s\n' "$ref"
+  printf 'Creator:  %s\n' "$creator"
+  printf 'Created:  %s\n' "$created"
+  printf 'Duration: %ss\n' "$duration"
+
+  # List steps with UUIDs so the user can copy them for `pipeline logs`
+  local steps_resp
+  steps_resp=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pipelines/${id}/steps/")
+
+  printf '\nSteps:\n'
+  printf '%s' "$steps_resp" | jq -r '.values[] | [
+    (.name // "(unnamed)"),
+    (.state.name // "?"),
+    (.state.result.name // "—"),
+    .uuid
+  ] | @tsv' | while IFS=$'\t' read -r name st res uuid; do
+    printf '  %-35s  %-15s  %-12s  %s\n' "$name" "$st" "$res" "$uuid"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# pipeline logs — fetch raw log for a pipeline step (text/plain endpoint)
+# ---------------------------------------------------------------------------
+pipeline_logs() {
+  local pipeline_id="" step_uuid=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*)
+        _die "unknown flag: $1" ;;
+      *)
+        if [ -z "$pipeline_id" ]; then
+          pipeline_id="$1"
+        elif [ -z "$step_uuid" ]; then
+          step_uuid="$1"
+        else
+          _die "unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [ -n "$pipeline_id" ] || _die "pipeline id is required. Usage: bb pipeline logs <pipeline_id> <step_uuid>"
+  [ -n "$step_uuid" ]   || _die "step uuid is required. Usage: bb pipeline logs <pipeline_id> <step_uuid>"
+
+  # Log endpoint returns text/plain — bb_api_raw skips the JSON Content-Type (same as pr_diff)
+  bb_api_raw GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pipelines/${pipeline_id}/steps/${step_uuid}/log"
+}
+
+# ---------------------------------------------------------------------------
+# pipeline run — trigger a pipeline (MUTATES — prompts for confirmation)
+# ---------------------------------------------------------------------------
+pipeline_run() {
+  local branch="" pattern="" yes=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch)  branch="$2";  shift 2 ;;
+      --pattern) pattern="$2"; shift 2 ;;
+      --yes|-y)  yes=true;     shift   ;;
+      -*)        _die "unknown flag: $1" ;;
+      *)         _die "unexpected argument: $1" ;;
+    esac
+  done
+
+  # Resolve branch: --branch → current git branch → repo default branch
+  if [ -z "$branch" ]; then
+    branch=$(git branch --show-current 2>/dev/null || true)
+  fi
+  if [ -z "$branch" ]; then
+    branch=$(get_default_branch)
+  fi
+
+  # Confirmation prompt (mirrors repo_create); --yes/-y bypasses for scripting
+  if [ "$yes" = false ]; then
+    local label="branch=${branch}"
+    [ -n "$pattern" ] && label="${label}, pattern=${pattern}"
+    printf 'Will trigger pipeline: %s/%s (%s)\n' "$BB_WORKSPACE" "$BB_REPO" "$label"
+    printf 'Trigger this pipeline? [y/N]: '
+    read -r reply
+    if ! printf '%s' "$reply" | grep -qE '^[Yy]$'; then
+      echo "Aborted."
+      return
+    fi
+  fi
+
+  # Build payload with jq — no string-concat of user input into JSON
+  local payload
+  if [ -n "$pattern" ]; then
+    payload=$(jq -n \
+      --arg branch  "$branch" \
+      --arg pattern "$pattern" \
+      '{target: {ref_type: "branch", type: "pipeline_ref_target", ref_name: $branch,
+         selector: {type: "custom", pattern: $pattern}}}')
+  else
+    payload=$(jq -n \
+      --arg branch "$branch" \
+      '{target: {ref_type: "branch", type: "pipeline_ref_target", ref_name: $branch}}')
+  fi
+
+  local resp
+  resp=$(bb_api POST "/repositories/${BB_WORKSPACE}/${BB_REPO}/pipelines/" --data "$payload")
+
+  local build_num state html_url
+  IFS=$'\t' read -r build_num state html_url <<<"$(printf '%s' "$resp" \
+    | jq -r --arg ws "$BB_WORKSPACE" --arg repo "$BB_REPO" \
+      '[
+        (.build_number | tostring),
+        (.state.name // "?"),
+        (.links.html.href // ("https://bitbucket.org/" + $ws + "/" + $repo + "/pipelines/results/" + (.build_number | tostring)))
+      ] | @tsv')"
+
+  printf '%bPipeline #%s triggered%b\n' "$C_BOLD" "$build_num" "$C_RESET"
+  printf 'State:  %s\n' "$state"
+  printf 'Branch: %s\n' "$branch"
+  printf 'URL:    %s\n' "$html_url"
+}
+
+# ---------------------------------------------------------------------------
+# pipeline dispatch
+# ---------------------------------------------------------------------------
+pipeline_dispatch() {
+  local subcmd="${1:-}"
+  [ -n "$subcmd" ] || { usage_pipeline; exit 1; }
+  shift
+
+  load_creds
+  detect_repo
+
+  case "$subcmd" in
+    list) pipeline_list "$@" ;;
+    view) pipeline_view "$@" ;;
+    logs) pipeline_logs "$@" ;;
+    run)  pipeline_run  "$@" ;;
+    *)
+      echo "error: unknown pipeline subcommand '$subcmd'" >&2
+      usage_pipeline
+      exit 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# completion — emit static shell completion script (no creds, no repo needed)
+# ---------------------------------------------------------------------------
+_completion_bash() {
+  cat <<'BASH_COMPLETION'
+# bb bash completion
+# Add to ~/.bashrc:
+#   eval "$(bb completion bash)"
+# Or write to a file and source it:
+#   bb completion bash > ~/.bb-completion.bash && source ~/.bb-completion.bash
+
+_bb_completion() {
+  local cur prev words cword
+  _init_completion 2>/dev/null || {
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    words=("${COMP_WORDS[@]}")
+    cword="$COMP_CWORD"
+  }
+
+  local top_cmds="auth pr repo pipeline api browse completion help version"
+
+  if [ "$cword" -eq 1 ]; then
+    COMPREPLY=($(compgen -W "$top_cmds" -- "$cur"))
+    return
+  fi
+
+  case "${words[1]}" in
+    auth)
+      COMPREPLY=($(compgen -W "login status logout" -- "$cur"))
+      ;;
+    pr)
+      COMPREPLY=($(compgen -W "create list view comment diff checks open merge decline reviewers approve request-changes checkout edit status commits files" -- "$cur"))
+      ;;
+    repo)
+      COMPREPLY=($(compgen -W "view list clone create" -- "$cur"))
+      ;;
+    pipeline)
+      COMPREPLY=($(compgen -W "list view logs run" -- "$cur"))
+      ;;
+    completion)
+      COMPREPLY=($(compgen -W "bash zsh" -- "$cur"))
+      ;;
+  esac
+}
+
+complete -F _bb_completion bb
+BASH_COMPLETION
+}
+
+_completion_zsh() {
+  cat <<'ZSH_COMPLETION'
+#compdef bb
+# bb zsh completion
+# Add to ~/.zshrc:
+#   eval "$(bb completion zsh)"
+# Or write to a file on fpath:
+#   bb completion zsh > "${fpath[1]}/_bb"
+
+_bb() {
+  local state line
+  typeset -A opt_args
+
+  _arguments \
+    '1: :->command' \
+    '*: :->args'
+
+  case "$state" in
+    command)
+      local commands=(
+        'auth:Manage authentication'
+        'pr:Pull request commands'
+        'repo:Repository commands'
+        'pipeline:Pipeline/CI commands'
+        'api:Call any Bitbucket API endpoint directly'
+        'browse:Open repo or file path in browser'
+        'completion:Print shell completion script'
+        'help:Show usage'
+        'version:Print version'
+      )
+      _describe 'command' commands
+      ;;
+    args)
+      case "$line[1]" in
+        auth)
+          local subcmds=(
+            'login:Interactive token setup'
+            'status:Verify current credentials'
+            'logout:Remove saved credentials'
+          )
+          _describe 'subcommand' subcmds
+          ;;
+        pr)
+          local subcmds=(
+            'create:Open a new pull request'
+            'list:List pull requests'
+            'view:Show PR details'
+            'comment:Post a comment on a PR'
+            'diff:Show raw diff'
+            'checks:Show build statuses'
+            'open:Open PR URL in browser'
+            'merge:Merge a pull request'
+            'decline:Decline a pull request'
+            'reviewers:Manage reviewers on a PR'
+            'approve:Approve a PR'
+            'request-changes:Request changes on a PR'
+            'checkout:Check out PR source branch locally'
+            'edit:Edit PR title/description/destination/reviewers'
+            'status:Show open PRs for current branch'
+            'commits:List commits in a PR'
+            'files:List files changed in a PR'
+          )
+          _describe 'subcommand' subcmds
+          ;;
+        repo)
+          local subcmds=(
+            'view:Show repository details'
+            'list:List repositories in a workspace'
+            'clone:Clone a repository'
+            'create:Create a new repository'
+          )
+          _describe 'subcommand' subcmds
+          ;;
+        pipeline)
+          local subcmds=(
+            'list:List recent pipelines'
+            'view:Show pipeline details and steps'
+            'logs:Fetch raw log for a pipeline step'
+            'run:Trigger a pipeline'
+          )
+          _describe 'subcommand' subcmds
+          ;;
+        completion)
+          local shells=('bash:Bash completion script' 'zsh:Zsh completion script')
+          _describe 'shell' shells
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_bb "$@"
+ZSH_COMPLETION
+}
+
+completion_cmd() {
+  local shell="${1:-}"
+  [ -n "$shell" ] || _die "shell is required. Usage: bb completion bash|zsh"
+
+  case "$shell" in
+    bash) _completion_bash ;;
+    zsh)  _completion_zsh  ;;
+    *)    _die "unknown shell '$shell'. Supported: bash, zsh" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # pr dispatch
 # ---------------------------------------------------------------------------
 pr_dispatch() {
@@ -1629,6 +2022,16 @@ pr_dispatch() {
 # ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
+usage_pipeline() {
+  cat >&2 <<'EOF'
+Usage:
+  bb pipeline list                          [--json]
+  bb pipeline view  <id>                    [--json]
+  bb pipeline logs  <pipeline_id> <step_uuid>
+  bb pipeline run   [--branch B] [--pattern CUSTOM] [--yes]
+EOF
+}
+
 usage_pr() {
   cat >&2 <<'EOF'
 Usage:
@@ -1710,9 +2113,16 @@ Repo subcommands:
   clone    Clone a repository
   create   Create a new repository (prompts for confirmation)
 
+Pipeline subcommands:
+  list     List recent pipelines (sorted newest-first)
+  view     Show pipeline details and step list (UUIDs for logs)
+  logs     Fetch raw log for a pipeline step
+  run      Trigger a pipeline (prompts for confirmation; --yes bypasses)
+
 Other commands:
   api             Call any Bitbucket API endpoint directly
   browse          Open the current repo (or a file path) in the browser
+  completion      Print shell completion script (bash|zsh)
 
 Note (v0.1):
   List commands show the first 50 results only (no pagination yet).
@@ -1726,20 +2136,22 @@ cmd="${1:-}"
 [ -n "$cmd" ] || { usage_main; exit 0; }
 shift
 
-# Fast paths — version/help shouldn't pay for dependency probes
+# Fast paths — version/help/completion shouldn't pay for dependency probes
 case "$cmd" in
-  help)    usage_main; exit 0 ;;
-  version) printf '%s\n' "$VERSION"; exit 0 ;;
+  help)       usage_main; exit 0 ;;
+  version)    printf '%s\n' "$VERSION"; exit 0 ;;
+  completion) completion_cmd "$@"; exit 0 ;;
 esac
 
 check_deps
 
 case "$cmd" in
-  pr)      pr_dispatch   "$@" ;;
-  auth)    auth_dispatch "$@" ;;
-  api)     api_cmd       "$@" ;;
-  repo)    repo_dispatch "$@" ;;
-  browse)  browse_cmd    "$@" ;;
+  pr)       pr_dispatch       "$@" ;;
+  auth)     auth_dispatch     "$@" ;;
+  api)      api_cmd           "$@" ;;
+  repo)     repo_dispatch     "$@" ;;
+  browse)   browse_cmd        "$@" ;;
+  pipeline) pipeline_dispatch "$@" ;;
   *)
     echo "error: unknown command '$cmd'" >&2
     usage_main >&2
