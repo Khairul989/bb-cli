@@ -2,6 +2,8 @@
 
 A `gh`-style command-line interface for Bitbucket Cloud, written in pure bash. Uses `curl` + `jq` against the Bitbucket REST API v2. No Python, Node, or Ruby required.
 
+> 🎉 **[v0.4.0](https://github.com/Khairul989/bb-cli/releases/tag/v0.4.0) is out** — the full daily git workflow: PR review loop (approve / request-changes / checkout / edit), `pr status / commits / files`, `repo view/list/clone/create`, `pipeline list/view/logs/run`, `browse`, an `api` escape hatch, and shell completion. See the [changelog](CHANGELOG.md).
+
 ---
 
 ## Install
