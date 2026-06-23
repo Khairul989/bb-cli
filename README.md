@@ -82,6 +82,11 @@ bb pr open 42
 | `bb pr merge <id> [--merge\|--squash\|--fast-forward] [--delete-branch] [--message MSG] [--json]` | Merge a pull request |
 | `bb pr decline <id> [--json]` | Decline a pull request |
 | `bb pr reviewers <id> [--add user1,user2] [--remove user3] [--set user1,user2]` | Manage reviewers on an existing PR |
+| `bb pr approve <id> [--undo] [--json]` | Approve a PR (or remove your approval with `--undo`) |
+| `bb pr request-changes <id> [--undo] [--json]` | Request changes on a PR (or remove with `--undo`) |
+| `bb pr checkout <id> [--branch NAME]` | Check out the PR source branch locally |
+| `bb pr edit <id> [--title T] [--body B \| --body-file F] [--dest BRANCH] [--reviewers user1,user2]` | Edit PR title, description, destination, or reviewers |
+| `bb api <METHOD> <PATH> [--data JSON \| --input FILE] [--json]` | Call any Bitbucket API endpoint directly |
 | `bb help` | Show usage |
 | `bb version` | Print version |
 

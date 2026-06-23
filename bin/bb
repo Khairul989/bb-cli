@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 BB_API_BASE="https://api.bitbucket.org/2.0"
 BB_CONFIG_FILE="$HOME/.config/bb/config"
 
@@ -872,6 +872,264 @@ pr_reviewers() {
 }
 
 # ---------------------------------------------------------------------------
+# pr approve — approve (or undo approval on) a pull request
+# ---------------------------------------------------------------------------
+pr_approve() {
+  local pr_id="" undo=false json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --undo) undo=true;     shift ;;
+      --json) json_out=true; shift ;;
+      -*)     _die "unknown flag: $1" ;;
+      *)      pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || { echo "error: PR id is required" >&2; exit 1; }
+
+  local resp
+  if [ "$undo" = true ]; then
+    # DELETE /approve returns 204 No Content on success — body will be empty
+    resp=$(bb_api DELETE "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}/approve")
+    if [ "$json_out" = true ]; then
+      [ -n "$resp" ] && printf '%s\n' "$resp" || printf '{}\n'
+      return
+    fi
+    printf 'PR #%s approval removed\n' "$pr_id"
+  else
+    resp=$(bb_api POST "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}/approve" \
+      --data '{}')
+    if [ "$json_out" = true ]; then
+      printf '%s\n' "$resp"
+      return
+    fi
+    printf '%bPR #%s approved%b\n' "$C_BOLD" "$pr_id" "$C_RESET"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# pr request-changes — request changes on (or undo request on) a pull request
+# ---------------------------------------------------------------------------
+pr_request_changes() {
+  local pr_id="" undo=false json_out=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --undo) undo=true;     shift ;;
+      --json) json_out=true; shift ;;
+      -*)     _die "unknown flag: $1" ;;
+      *)      pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || { echo "error: PR id is required" >&2; exit 1; }
+
+  local resp
+  if [ "$undo" = true ]; then
+    # DELETE /request-changes returns 204 No Content on success — body will be empty
+    resp=$(bb_api DELETE "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}/request-changes")
+    if [ "$json_out" = true ]; then
+      [ -n "$resp" ] && printf '%s\n' "$resp" || printf '{}\n'
+      return
+    fi
+    printf 'PR #%s request removed\n' "$pr_id"
+  else
+    resp=$(bb_api POST "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}/request-changes" \
+      --data '{}')
+    if [ "$json_out" = true ]; then
+      printf '%s\n' "$resp"
+      return
+    fi
+    printf '%bPR #%s changes requested%b\n' "$C_BOLD" "$pr_id" "$C_RESET"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# pr checkout — check out the source branch of a pull request locally
+# ---------------------------------------------------------------------------
+pr_checkout() {
+  local pr_id="" local_branch=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch) local_branch="$2"; shift 2 ;;
+      -*)       _die "unknown flag: $1" ;;
+      *)        pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || { echo "error: PR id is required" >&2; exit 1; }
+
+  local pr_json
+  pr_json=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}")
+
+  local src_branch src_full_name
+  IFS=$'\t' read -r src_branch src_full_name <<<"$(printf '%s' "$pr_json" \
+    | jq -r '[.source.branch.name, .source.repository.full_name] | @tsv')"
+
+  local checkout_as="${local_branch:-$src_branch}"
+
+  if [ "$src_full_name" = "${BB_WORKSPACE}/${BB_REPO}" ]; then
+    # Same-repo PR: fetch from origin then check out (create tracking branch if missing)
+    git fetch origin "$src_branch"
+    if ! git checkout "$checkout_as" 2>/dev/null; then
+      git checkout -b "$checkout_as" "origin/$src_branch"
+    fi
+  else
+    # Cross-fork PR: source lives in a different repository
+    _warn "PR #${pr_id} is a cross-fork PR (source: ${src_full_name})"
+    local clone_url="https://bitbucket.org/${src_full_name}.git"
+    printf 'Source: %s\n' "$clone_url"
+    printf 'Fetching fork branch...\n'
+    if git fetch "$clone_url" "${src_branch}:${checkout_as}"; then
+      git checkout "$checkout_as"
+    else
+      printf '\nManual steps:\n' >&2
+      printf '  git fetch %s %s:%s\n' "$clone_url" "$src_branch" "$checkout_as" >&2
+      printf '  git checkout %s\n' "$checkout_as" >&2
+      exit 1
+    fi
+  fi
+
+  printf 'Checked out: %s\n' "$checkout_as"
+}
+
+# ---------------------------------------------------------------------------
+# pr edit — update title, description, destination branch, or reviewers.
+# GET-first then PUT so unspecified fields are NOT blanked (same pattern as
+# pr_reviewers: PUT replaces the whole object, so we carry existing values).
+# ---------------------------------------------------------------------------
+pr_edit() {
+  local pr_id="" title="" body="" body_file="" dest="" reviewers_csv=""
+  local has_title=false has_body=false has_dest=false has_reviewers=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title)     title="$2";         has_title=true;     shift 2 ;;
+      --body)      body="$2";          has_body=true;      shift 2 ;;
+      --body-file) body_file="$2";     has_body=true;      shift 2 ;;
+      --dest)      dest="$2";          has_dest=true;      shift 2 ;;
+      --reviewers) reviewers_csv="$2"; has_reviewers=true; shift 2 ;;
+      -*)          _die "unknown flag: $1" ;;
+      *)           pr_id="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$pr_id" ] || { echo "error: PR id is required" >&2; exit 1; }
+
+  if [ "$has_title" = false ] && [ "$has_body" = false ] && \
+     [ "$has_dest" = false ] && [ "$has_reviewers" = false ]; then
+    _die "specify at least one of: --title, --body, --body-file, --dest, --reviewers"
+  fi
+
+  if [ -n "$body_file" ]; then
+    [ -f "$body_file" ] || { echo "error: body file not found: $body_file" >&2; exit 1; }
+    body=$(< "$body_file")
+  fi
+
+  # Resolve reviewer CSV → JSON array of UUID strings (mirrors pr_reviewers)
+  local reviewers_uuids="[]"
+  if [ "$has_reviewers" = true ]; then
+    reviewers_uuids=$(_resolve_csv_to_uuids "$reviewers_csv")
+  fi
+
+  # GET current PR to carry forward any fields the user did not specify
+  local pr_json
+  pr_json=$(bb_api GET "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}")
+
+  # Build PUT payload — only override what was explicitly passed
+  local payload
+  payload=$(printf '%s' "$pr_json" | jq -c \
+    --arg     new_title     "$title" \
+    --argjson has_title     "$has_title" \
+    --arg     new_desc      "$body" \
+    --argjson has_body      "$has_body" \
+    --arg     new_dest      "$dest" \
+    --argjson has_dest      "$has_dest" \
+    --argjson new_reviewers "$reviewers_uuids" \
+    --argjson has_reviewers "$has_reviewers" \
+    '{
+      title:       (if $has_title     then $new_title else .title end),
+      description: (if $has_body      then $new_desc  else (.description // "") end),
+      destination: {branch: {name: (if $has_dest then $new_dest else .destination.branch.name end)}},
+      reviewers:   (if $has_reviewers
+                    then [$new_reviewers[] | {uuid: .}]
+                    else [.reviewers[]?   | {uuid: .uuid}]
+                   end)
+    }')
+
+  local resp
+  resp=$(bb_api PUT "/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${pr_id}" \
+    --data "$payload")
+
+  local updated_title updated_state
+  IFS=$'\t' read -r updated_title updated_state <<<"$(printf '%s' "$resp" \
+    | jq -r '[.title, .state] | @tsv')"
+
+  printf '%bPR #%s updated%b\n' "$C_BOLD" "$pr_id" "$C_RESET"
+  printf 'Title: %s\n' "$updated_title"
+  printf 'State: %s\n' "$(colorize_state "$updated_state")"
+}
+
+# ---------------------------------------------------------------------------
+# api — escape hatch: call any Bitbucket API endpoint directly
+# ---------------------------------------------------------------------------
+api_cmd() {
+  load_creds
+
+  local method="" path="" body="" body_file="" json_out=false
+  local data_set=false input_set=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --data)  body="$2";      data_set=true;  shift 2 ;;
+      --input) body_file="$2"; input_set=true; shift 2 ;;
+      --json)  json_out=true;  shift ;;
+      -*)      _die "unknown flag: $1" ;;
+      *)
+        if [ -z "$method" ]; then
+          method="$1"
+        elif [ -z "$path" ]; then
+          path="$1"
+        else
+          _die "unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [ -n "$method" ] || _die "METHOD is required. Usage: bb api <METHOD> <PATH> [--data JSON | --input FILE]"
+  [ -n "$path"   ] || _die "PATH is required. Usage: bb api <METHOD> <PATH> [--data JSON | --input FILE]"
+  [ "$data_set" = true ] && [ "$input_set" = true ] && _die "--data and --input are mutually exclusive"
+
+  if [ "$input_set" = true ]; then
+    [ -f "$body_file" ] || _die "input file not found: $body_file"
+    body=$(< "$body_file")
+  fi
+
+  local resp
+  if [ -n "$body" ]; then
+    resp=$(bb_api "$method" "$path" --data "$body")
+  else
+    resp=$(bb_api "$method" "$path")
+  fi
+
+  if [ "$json_out" = true ]; then
+    printf '%s\n' "$resp"
+    return
+  fi
+
+  # Pretty-print if valid JSON; fall back to raw output for non-JSON endpoints
+  if printf '%s' "$resp" | jq . 2>/dev/null; then
+    :
+  else
+    printf '%s\n' "$resp"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # pr dispatch
 # ---------------------------------------------------------------------------
 pr_dispatch() {
@@ -891,8 +1149,12 @@ pr_dispatch() {
     checks)  pr_checks  "$@" ;;
     open)    pr_open    "$@" ;;
     merge)   pr_merge   "$@" ;;
-    decline) pr_decline "$@" ;;
-    reviewers) pr_reviewers "$@" ;;
+    decline)         pr_decline         "$@" ;;
+    reviewers)       pr_reviewers       "$@" ;;
+    approve)         pr_approve         "$@" ;;
+    request-changes) pr_request_changes "$@" ;;
+    checkout)        pr_checkout        "$@" ;;
+    edit)            pr_edit            "$@" ;;
     *)
       echo "error: unknown pr subcommand '$subcmd'" >&2
       usage_pr
@@ -915,8 +1177,12 @@ Usage:
   bb pr checks   <id>
   bb pr open     <id>
   bb pr merge    <id> [--merge|--squash|--fast-forward] [--delete-branch] [--message MSG] [--json]
-  bb pr decline  <id> [--json]
-  bb pr reviewers <id> [--add user1,user2] [--remove user3] [--set user1,user2]
+  bb pr decline          <id> [--json]
+  bb pr reviewers        <id> [--add user1,user2] [--remove user3] [--set user1,user2]
+  bb pr approve          <id> [--undo] [--json]
+  bb pr request-changes  <id> [--undo] [--json]
+  bb pr checkout         <id> [--branch NAME]
+  bb pr edit             <id> [--title T] [--body B | --body-file F] [--dest BRANCH] [--reviewers user1,user2]
 EOF
 }
 
@@ -953,7 +1219,14 @@ PR subcommands:
   open     Open PR in browser
   merge    Merge a pull request
   decline  Decline a pull request
-  reviewers Add/remove/set reviewers on a PR
+  reviewers       Add/remove/set reviewers on a PR
+  approve         Approve a pull request
+  request-changes Request changes on a pull request
+  checkout        Check out the PR source branch locally
+  edit            Edit PR title, description, destination, or reviewers
+
+Other commands:
+  api             Call any Bitbucket API endpoint directly
 
 Note (v0.1):
   List commands show the first 50 results only (no pagination yet).
@@ -978,6 +1251,7 @@ check_deps
 case "$cmd" in
   pr)      pr_dispatch   "$@" ;;
   auth)    auth_dispatch "$@" ;;
+  api)     api_cmd       "$@" ;;
   *)
     echo "error: unknown command '$cmd'" >&2
     usage_main >&2
