@@ -49,18 +49,58 @@ Credentials are resolved in priority order: environment variables (`BB_EMAIL`, `
 
 ## Quick start
 
+**Open & inspect PRs**
+
 ```bash
-# List open PRs in the current repo
-bb pr list
+bb pr list                                   # open PRs in the current repo
+bb pr create --title "Fix login" --fill      # title + body auto-filled from commits
+bb pr create --web                           # or just open the compare page in browser
+bb pr status                                 # PR(s) for your current branch + approval state
+bb pr view 42                                # details
+bb pr commits 42                             # commits in the PR
+bb pr files 42                               # files changed (+/- per file)
+bb pr diff 42                                # raw diff
+bb pr checks 42                              # CI build statuses
+```
 
-# Create a PR from current branch
-bb pr create --title "Fix login bug" --body "Fixes the login timeout issue."
+**Review loop**
 
-# View PR #42
-bb pr view 42
+```bash
+bb pr checkout 42                            # check the PR branch out locally
+bb pr approve 42                             # approve   (bb pr approve 42 --undo to retract)
+bb pr request-changes 42                     # request changes (--undo to retract)
+bb pr comment 42 --body "LGTM after nits"
+bb pr edit 42 --title "New title"            # edit title/body/dest/reviewers (other fields preserved)
+bb pr reviewers 42 --add alice,bob           # manage reviewers on an open PR
+bb pr merge 42 --squash --delete-branch
+```
 
-# Open PR #42 in your browser
-bb pr open 42
+**Repos**
+
+```bash
+bb repo view                                 # current repo (or: bb repo view workspace/other-repo)
+bb repo list myworkspace                     # repos in a workspace
+bb repo clone myworkspace/some-repo          # --ssh for the SSH URL
+bb repo create new-repo --private --yes      # create (prompts unless --yes)
+bb browse                                    # open the repo in your browser
+bb browse src/index.ts                       # ...or a specific file on the current branch
+```
+
+**Pipelines (CI)**
+
+```bash
+bb pipeline list                             # recent pipelines
+bb pipeline view 123                         # pipeline #123 + its steps (with step UUIDs)
+bb pipeline logs 123 <step_uuid>             # raw log for one step
+bb pipeline run --branch main --yes          # trigger a run (prompts unless --yes)
+```
+
+**Escape hatch & shell completion**
+
+```bash
+bb api GET /user                             # call any Bitbucket API endpoint directly
+bb api POST /repositories/ws/repo/... --input body.json
+eval "$(bb completion bash)"                 # tab-completion (or: bb completion zsh)
 ```
 
 ---
@@ -136,13 +176,14 @@ State colors in output: open=yellow, merged=green, declined=red, superseded/draf
 
 ### Pagination
 
-v0.1 shows the first 50 results per state. Full pagination is on the roadmap.
+List commands show the first 50 results per state (20 for `pipeline list`). Full pagination is on the roadmap.
 
 ---
 
-## Limitations (v0.1)
+## Limitations
 
-- `--mine` filter is not supported — Atlassian removed the cross-workspace `/2.0/user` endpoint (CHANGE-2770, Feb 2026). Use `--author USERNAME` if you need author filtering (planned for v0.2).
+- `--mine` filter is not supported — Atlassian removed the cross-workspace `/2.0/user` endpoint (CHANGE-2770, Feb 2026). Author filtering via `--author USERNAME` is on the roadmap.
+- Inline (diff-anchored) PR comments are not yet supported — `bb pr comment` posts top-level comments only.
 
 ---
 
